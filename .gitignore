@@ -1,0 +1,33 @@
+# macOS and editor metadata
+.DS_Store
+.idea/
+.vscode/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.pycache_tmp/
+
+# Local dependency vendor directory for Blender Python
+.vendor/
+
+# Generated experiment outputs
+outputs/
+*.blend
+*.blend1
+*.mp4
+*.mov
+
+# Local reports and large generated artifacts
+Final Heuristic results.pdf
+
+# Local asset drops. Keep the Meshy directory, but do not commit large GLB files
+# unless their license and size are appropriate for the repository.
+Meshy/*.glb
+
+# Local secrets
+.env
+.env.*
+api_keys.json
