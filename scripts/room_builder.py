@@ -20,13 +20,6 @@ from mathutils import Vector
 CONFIG = {}
 
 
-def _resolve_path(base_dir: Path, value: str) -> str:
-    path = Path(value)
-    if path.is_absolute():
-        return str(path)
-    return str((base_dir / path).resolve())
-
-
 def load_config(config_path: str) -> dict:
     """
     Load configuration from pipeline_config.json and map it to the
@@ -40,7 +33,6 @@ def load_config(config_path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         pipeline_cfg = json.load(f)
 
-    config_dir = path.resolve().parent
     scene = pipeline_cfg["scene"]
 
     # Map pipeline_config.json fields to room_builder's expected CONFIG keys
@@ -48,9 +40,9 @@ def load_config(config_path: str) -> dict:
         "seed": scene["seed"],
         "mode": scene["mode"],
         "force_complete_random": scene.get("force_complete_random", False),
-        "mesh_folder": _resolve_path(config_dir, scene["mesh_folder"]),
-        "output_json": _resolve_path(config_dir, scene["output_manifest"]),
-        "manifest_path": _resolve_path(config_dir, scene["manifest_path"]),
+        "mesh_folder": scene["mesh_folder"],
+        "output_json": scene["output_manifest"],
+        "manifest_path": scene["manifest_path"],
         "clear_scene_first": scene.get("clear_scene_first", True),
         "origin": scene.get("origin", [0.0, 0.0, 0.0]),
         "room": scene["room"],

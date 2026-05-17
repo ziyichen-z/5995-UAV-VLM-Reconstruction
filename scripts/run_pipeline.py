@@ -13,6 +13,7 @@ Options:
 
 import sys
 import os
+import csv
 import json
 import time
 import argparse
@@ -24,9 +25,6 @@ from datetime import datetime
 SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
-VENDOR_DIR = SCRIPTS_DIR.parent / ".vendor"
-if VENDOR_DIR.exists() and str(VENDOR_DIR) not in sys.path:
-    sys.path.insert(0, str(VENDOR_DIR))
 
 import bpy
 
@@ -35,10 +33,10 @@ import bpy
 import importlib
 import room_builder, lighting_setup, camera_initializer, trajectory_planner
 import capture_manager_live, video_export, coverage_manager, candidate_generator
-import vlm_controller, exploration_manager
+import vlm_controller, exploration_manager, heuristic_exploration_manager
 for _mod in [room_builder, lighting_setup, camera_initializer, trajectory_planner,
              capture_manager_live, video_export, coverage_manager, candidate_generator,
-             vlm_controller, exploration_manager]:
+             vlm_controller, exploration_manager, heuristic_exploration_manager]:
     importlib.reload(_mod)
 
 from lighting_setup      import LightingSetup
@@ -49,6 +47,7 @@ from video_export        import VideoExporter
 from coverage_manager    import CoverageManager
 from vlm_controller      import VLMController
 from exploration_manager import ExplorationManager
+from heuristic_exploration_manager import HeuristicExplorationManager
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,22 +65,11 @@ def parse_args() -> argparse.Namespace:
                    help="Skip phases 1-6 and reuse frames from --run-dir")
     p.add_argument("--run-dir",       default=None,
                    help="Existing run directory to reuse when --skip-capture is set")
+    p.add_argument("--selection-policy",
+                   choices=["vlm", "heuristic", "both"],
+                   default="vlm",
+                   help="Supplementary selection policy to evaluate")
     return p.parse_args(argv)
-
-
-def _resolve_path(base_dir: Path, value: str) -> str:
-    path = Path(value)
-    if path.is_absolute():
-        return str(path)
-    return str((base_dir / path).resolve())
-
-
-def _display_path(value) -> str:
-    path = Path(value)
-    try:
-        return str(path.resolve().relative_to(Path.cwd().resolve()))
-    except Exception:
-        return path.name if path.is_absolute() else str(path)
 
 
 def load_pipeline_config(config_path: str) -> dict:
@@ -90,14 +78,6 @@ def load_pipeline_config(config_path: str) -> dict:
         raise FileNotFoundError(f"Config not found: {path}")
     with open(path, encoding="utf-8") as f:
         cfg = json.load(f)
-    config_dir = path.resolve().parent
-    scene = cfg.get("scene", {})
-    for key in ("mesh_folder", "output_manifest", "manifest_path"):
-        if key in scene:
-            scene[key] = _resolve_path(config_dir, scene[key])
-    output = cfg.get("output", {})
-    if "base_dir" in output:
-        output["base_dir"] = _resolve_path(config_dir, output["base_dir"])
     print(f"[Pipeline] Config loaded: {path}")
     return cfg
 
@@ -115,6 +95,148 @@ def make_run_dir(cfg: dict) -> Path:
 def load_room_manifest(manifest_path: str) -> dict:
     with open(manifest_path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_base_pose_logs(run_dir: Path, camera_objects: dict) -> dict:
+    pose_logs = {}
+    for cam_id in camera_objects:
+        pose_path = run_dir / "captures" / "base" / cam_id / "pose_log.json"
+        if pose_path.exists():
+            with open(pose_path) as f:
+                pose_logs[cam_id] = json.load(f)
+            print(f"[Pipeline] Loaded {len(pose_logs[cam_id])} poses for {cam_id}")
+    return pose_logs
+
+
+def clone_pose_logs(pose_logs: dict) -> dict:
+    return json.loads(json.dumps(pose_logs))
+
+
+def run_supplementary_policy(policy: str, cfg: dict, run_dir: Path,
+                             camera_objects: dict, room_manifest: dict,
+                             coverage_summary: dict,
+                             pose_logs: dict,
+                             isolated_output: bool = False) -> dict:
+    policy_output_dir = run_dir / "comparison" / policy if isolated_output else run_dir
+
+    if policy == "vlm":
+        print("\n=== Phases 8-9: VLM-Guided Supplementary Capture ===")
+        explorer = ExplorationManager(
+            cfg, policy_output_dir, camera_objects, room_manifest,
+            base_run_dir=run_dir
+        )
+    elif policy == "heuristic":
+        print("\n=== Phases 8-9: Heuristic Supplementary Capture ===")
+        explorer = HeuristicExplorationManager(
+            cfg, policy_output_dir, camera_objects, room_manifest,
+            base_run_dir=run_dir
+        )
+    else:
+        raise ValueError(f"Unknown selection policy: {policy}")
+
+    result = explorer.explore(coverage_summary, clone_pose_logs(pose_logs))
+    result["policy"] = policy
+    result["output_dir"] = str(policy_output_dir)
+    return result
+
+
+def write_selection_comparison_outputs(comparison: dict, comparison_dir: Path):
+    comparison_dir.mkdir(parents=True, exist_ok=True)
+    with open(comparison_dir / "selection_policy_comparison.json", "w") as f:
+        json.dump(comparison, f, indent=2)
+
+    rows = []
+    for policy, summary in comparison.get("policies", {}).items():
+        for step in summary.get("step_logs", []):
+            rows.append({
+                "policy":           policy,
+                "step":             step.get("step"),
+                "round":            step.get("round"),
+                "visit_id":         step.get("visit_id"),
+                "camera":           step.get("camera"),
+                "approach":         step.get("approach"),
+                "frames_captured":  step.get("frames_captured"),
+                "coverage_before":  step.get("coverage_before"),
+                "coverage_after":   step.get("coverage_after"),
+                "coverage_gain":    step.get("coverage_gain"),
+                "cumulative_gain":  step.get("cumulative_gain"),
+                "budget_remaining": step.get("budget_remaining"),
+                "output_dir":       summary.get("output_dir"),
+                "problem":          step.get("problem", ""),
+            })
+
+    if not rows:
+        return
+
+    csv_path = comparison_dir / "selection_policy_steps.csv"
+    fieldnames = [
+        "policy", "step", "round", "visit_id", "camera", "approach",
+        "frames_captured", "coverage_before", "coverage_after",
+        "coverage_gain", "cumulative_gain", "budget_remaining",
+        "output_dir", "problem",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def summarize_policy_result(result: dict, initial_coverage: dict) -> dict:
+    final_ratio = result["final_coverage"]["coverage_ratio"]
+    budget = result.get("budget", {})
+    return {
+        "final_coverage": final_ratio,
+        "coverage_gain": round(
+            final_ratio - initial_coverage["coverage_ratio"], 4
+        ),
+        "rounds_completed": result.get("rounds_completed", 0),
+        "frames_used": budget.get("frames_used", 0),
+        "visits_used": budget.get("visits_used", 0),
+        "output_dir": result.get("output_dir"),
+        "round_logs": result.get("round_logs", []),
+        "step_logs": result.get("step_logs", []),
+    }
+
+
+def run_selection_comparison(cfg: dict, run_dir: Path, camera_objects: dict,
+                             room_manifest: dict, coverage_summary: dict,
+                             selection_policy: str) -> dict:
+    pose_logs = load_base_pose_logs(run_dir, camera_objects)
+    if not pose_logs:
+        print("[Pipeline] No base pose logs available for supplementary capture.")
+        return {}
+
+    policies = ["vlm", "heuristic"] if selection_policy == "both" else [selection_policy]
+    results = {}
+    for policy in policies:
+        t = time.time()
+        result = run_supplementary_policy(
+            policy, cfg, run_dir, camera_objects, room_manifest,
+            coverage_summary, pose_logs, isolated_output=(selection_policy == "both")
+        )
+        summary = summarize_policy_result(result, coverage_summary)
+        summary["elapsed"] = round(time.time() - t, 2)
+        results[policy] = summary
+
+    comparison = {
+        "initial_coverage": coverage_summary["coverage_ratio"],
+        "policies": results,
+    }
+    write_selection_comparison_outputs(comparison, run_dir / "comparison")
+
+    if selection_policy == "both":
+        print("\n=== Selection Policy Comparison ===")
+        for policy, summary in comparison["policies"].items():
+            print(f"[Pipeline] {policy}: "
+                  f"{summary['final_coverage']:.1%} coverage "
+                  f"(gain {summary['coverage_gain']:.1%}, "
+                  f"{summary['frames_used']} frames)")
+    else:
+        summary = comparison["policies"][selection_policy]
+        print(f"[Pipeline] Final coverage ({selection_policy}): "
+              f"{summary['final_coverage']:.1%}")
+
+    return comparison
 
 
 def main():
@@ -148,23 +270,21 @@ def main():
         coverage_summary = coverage_mgr.analyze(run_dir / "captures", round_prefix="base")
         print(f"[Pipeline] Coverage: {coverage_summary['coverage_ratio']:.1%}")
 
-        # Run VLM loop
+        # Run supplementary selection loop
+        final_coverage = coverage_summary
         if not args.skip_vlm:
-            print("\n=== Phases 8-9: VLM-Guided Supplementary Capture ===")
-            pose_logs = {}
-            for cam_id in camera_objects:
-                pose_path = run_dir / "captures" / "base" / cam_id / "pose_log.json"
-                if pose_path.exists():
-                    with open(pose_path) as f:
-                        pose_logs[cam_id] = json.load(f)
-                    print(f"[Pipeline] Loaded {len(pose_logs[cam_id])} poses for {cam_id}")
-
-            explorer           = ExplorationManager(cfg, run_dir, camera_objects, room_manifest)
-            exploration_result = explorer.explore(coverage_summary, pose_logs)
-            final_coverage     = exploration_result["final_coverage"]
-            print(f"[Pipeline] Final coverage: {final_coverage['coverage_ratio']:.1%}")
+            comparison = run_selection_comparison(
+                cfg, run_dir, camera_objects, room_manifest,
+                coverage_summary, args.selection_policy
+            )
+            if comparison.get("policies"):
+                best = max(
+                    comparison["policies"].values(),
+                    key=lambda p: p["final_coverage"]
+                )
+                final_coverage = {"coverage_ratio": best["final_coverage"]}
         else:
-            print("[Pipeline] VLM exploration skipped.")
+            print("[Pipeline] Supplementary exploration skipped.")
 
         bpy.ops.wm.save_as_mainfile(filepath=str(run_dir / "scene_final.blend"))
         print(f"\n[Pipeline] Done. Output: {run_dir}")
@@ -179,7 +299,7 @@ def main():
 
     pipeline_log = {
         "started": datetime.now().isoformat(),
-        "config":  _display_path(args.config),
+        "config":  args.config,
         "phases":  {}
     }
 
@@ -201,7 +321,7 @@ def main():
             room_builder.build_scene_from_config()
 
         pipeline_log["phases"]["scene_build"] = {
-            "manifest": _display_path(manifest_path),
+            "manifest": manifest_path,
             "elapsed":  round(time.time() - t, 2)
         }
     else:
@@ -280,35 +400,33 @@ def main():
     }
     print(f"[Pipeline] Initial coverage: {coverage_summary['coverage_ratio']:.1%}")
 
-    # ── Phases 8-9: VLM-Guided Supplementary Capture ─────────────────────────
+    # ── Phases 8-9: Supplementary Capture ────────────────────────────────────
     final_coverage = coverage_summary
     if not args.skip_vlm:
-        print("\n=== Phases 8-9: VLM-Guided Supplementary Capture ===")
+        print(f"\n=== Supplementary Capture Policy: {args.selection_policy} ===")
         t = time.time()
 
-        # Load pose logs — these are the keyframe source for VLM
-        # The VLM only receives images from these logs, never the coverage data
-        pose_logs = {}
-        for cam_id in camera_objects:
-            pose_path = run_dir / "captures" / "base" / cam_id / "pose_log.json"
-            if pose_path.exists():
-                with open(pose_path) as f:
-                    pose_logs[cam_id] = json.load(f)
-                print(f"[Pipeline] Loaded {len(pose_logs[cam_id])} poses for {cam_id}")
+        comparison = run_selection_comparison(
+            cfg, run_dir, camera_objects, room_manifest,
+            coverage_summary, args.selection_policy
+        )
+        if comparison.get("policies"):
+            best = max(
+                comparison["policies"].values(),
+                key=lambda p: p["final_coverage"]
+            )
+            final_coverage = {"coverage_ratio": best["final_coverage"]}
 
-        explorer           = ExplorationManager(cfg, run_dir, camera_objects, room_manifest)
-        exploration_result = explorer.explore(coverage_summary, pose_logs)
-        final_coverage     = exploration_result["final_coverage"]
         pipeline_log["phases"]["exploration"] = {
-            "rounds_completed": exploration_result["rounds_completed"],
+            "selection_policy": args.selection_policy,
             "initial_coverage": coverage_summary["coverage_ratio"],
             "final_coverage":   final_coverage["coverage_ratio"],
-            "budget":           exploration_result.get("budget", {}),
+            "comparison":       comparison.get("policies", {}),
             "elapsed":          round(time.time() - t, 2)
         }
         print(f"[Pipeline] Final coverage: {final_coverage['coverage_ratio']:.1%}")
     else:
-        print("[Pipeline] VLM exploration skipped.")
+        print("[Pipeline] Supplementary exploration skipped.")
 
     # ── Save final .blend and archive logs ───────────────────────────────────
     bpy.ops.wm.save_as_mainfile(filepath=str(run_dir / "scene_final.blend"))

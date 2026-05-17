@@ -1,13 +1,13 @@
 """
 capture_manager_live.py
-CaptureManager with live viewport refresh support.
+带实时双 viewport 刷新的 CaptureManager。
 
-Left viewport: top-down orthographic overview of camera positions.
-Right viewport: active camera view.
+左侧 viewport：俯视正交总览，看到相机在房间里的位置
+右侧 viewport：当前相机的拍摄视野
 
-Typical use:
-  1. Run setup_viewport.py from Blender's Scripting panel.
-  2. Start the main pipeline with run_live.sh.
+配合 setup_viewport.py 使用：
+  1. 在 Blender Scripting 面板里先运行 setup_viewport.py
+  2. 再用 run_live.sh 启动主程序
 """
 
 import bpy
@@ -94,7 +94,7 @@ class CaptureManagerLive(CaptureManager):
 
     # ------------------------------------------------------------------ #
     def _apply_waypoint_live(self, cam_obj, wp: tuple, frame_number: int = 0):
-        """Move the camera and refresh overview/camera viewports."""
+        """移动相机并同时刷新左侧总览和右侧相机视野。"""
         x, y, z, rx, ry, rz = wp
         cam_obj.location       = (x, y, z)
         cam_obj.rotation_euler = Euler((rx, ry, rz), "XYZ")
@@ -119,22 +119,21 @@ class CaptureManagerLive(CaptureManager):
     @staticmethod
     def _hide_walls_viewport():
         """
-        Hide wall/floor objects in the viewport only.
-        hide_set does not affect rendered output. This is called after camera
-        switches so shell objects stay hidden once the scene exists.
+        将墙体/地板对象在 viewport 中隐藏（hide_set 不影响渲染输出）。
+        每次切换相机时调用，确保场景建好后墙壁保持隐藏。
         """
         keywords = ('Wall', 'wall', 'Floor', 'floor', 'Ceiling', 'ceiling')
         for obj in bpy.data.objects:
             if any(kw in obj.name for kw in keywords):
-                if not obj.hide_get():
+                if not obj.hide_get():          # 避免重复打印
                     obj.hide_set(True)
 
     def _configure_viewports(self, cam_obj):
         """
-        Three-pane viewport layout, refreshed on camera switches:
-          left: top-down orthographic overview
-          middle: fixed oblique perspective of the full room
-          right: active camera view
+        三栏 viewport 布局（每次切换相机时调用）：
+          左栏：俯视正交总览
+          中栏：全视角透视（固定斜上方视角，看到房间整体结构）
+          右栏：当前激活相机的拍摄视野
         """
         import mathutils
 
@@ -147,20 +146,20 @@ class CaptureManagerLive(CaptureManager):
         if not view3d_areas:
             return
 
-        # Hide room shell objects after the scene has been built.
+        # 隐藏墙体（场景已建好后生效）
         self._hide_walls_viewport()
 
-        # Sort by x coordinate to preserve left-to-right pane order.
+        # 按 x 坐标排序，保证 左→中→右 顺序正确
         view3d_areas.sort(key=lambda a: a.x)
 
-        # One viewport: use it as the active camera view.
+        # ── 只有 1 个 viewport：直接设为相机视野 ─────────────────────────────
         if len(view3d_areas) == 1:
             for space in view3d_areas[0].spaces:
                 if space.type == 'VIEW_3D':
                     space.region_3d.view_perspective = 'CAMERA'
             return
 
-        # Two viewports: left overview, right active camera.
+        # ── 2 个 viewport（兼容旧布局）：左=俯视  右=相机 ────────────────────
         if len(view3d_areas) == 2:
             for space in view3d_areas[0].spaces:
                 if space.type == 'VIEW_3D':
@@ -179,25 +178,25 @@ class CaptureManagerLive(CaptureManager):
             print(f"[CaptureManagerLive] 2-pane: left=ortho  right={cam_obj.name}")
             return
 
-        # Three or more viewports: overview | perspective | camera.
-        # Left pane: top-down orthographic view.
+        # ── 3 个及以上 viewport：左=俯视  中=全视角  右=相机 ─────────────────
+        # 左栏：俯视正交
         for space in view3d_areas[0].spaces:
             if space.type == 'VIEW_3D':
                 r3d = space.region_3d
                 r3d.view_perspective = 'ORTHO'
-                if r3d.view_distance != 20.0:
+                if r3d.view_distance != 20.0:   # 只在首次配置时写入，避免闪烁
                     r3d.view_rotation = mathutils.Quaternion((1.0, 0.0, 0.0, 0.0))
                     r3d.view_distance = 20.0
                     r3d.view_location = (0.0, 0.0, 0.0)
                 space.overlay.show_extras = True
                 break
 
-        # Middle pane: fixed oblique perspective, independent of camera changes.
+        # 中栏：全视角透视（固定斜上方 45°，不随相机切换而变化）
         for space in view3d_areas[1].spaces:
             if space.type == 'VIEW_3D':
                 r3d = space.region_3d
                 r3d.view_perspective = 'PERSP'
-                if r3d.view_distance != 25.0:
+                if r3d.view_distance != 25.0:   # 只在首次配置时写入
                     r3d.view_rotation = mathutils.Euler(
                         (1.1, 0.0, -0.785), 'XYZ').to_quaternion()
                     r3d.view_distance = 25.0
@@ -205,7 +204,7 @@ class CaptureManagerLive(CaptureManager):
                 space.overlay.show_extras = True
                 break
 
-        # Right pane: active camera view.
+        # 右栏：当前激活相机视野
         for space in view3d_areas[2].spaces:
             if space.type == 'VIEW_3D':
                 space.region_3d.view_perspective = 'CAMERA'

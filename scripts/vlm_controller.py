@@ -43,39 +43,28 @@ class VLMController:
     # ------------------------------------------------------------------ #
     def decide(self, keyframes: list, budget_summary: dict,
                visit_history: list = None,
-               blocked_frames: list = None,
-               recent_evidence: list = None) -> dict:
+               blocked_frames: list = None) -> dict:
         """
-        Call VLM with observation frames plus optional recent evidence frames.
+        Call VLM with keyframe images only.
         Returns a list of visual targets for supplementary capture.
 
         Args:
-            keyframes:       ordinary observation frames. This list may include
-                             algorithm-selected hint frames, but that role is
-                             intentionally hidden from the VLM so it does not
-                             overfit to the algorithm's suggestions.
-            budget_summary:  current budget state
-            visit_history:   executed visits [{round, camera, approach,
-                             reference_frame, problem}, ...]
-            blocked_frames:  [FIX-2] reference_frame IDs rejected by spatial
-                             dedup — VLM must not re-propose these.
-            recent_evidence: representative frames from successful recent
-                             supplementary visits. These are labeled separately
-                             so the VLM can visually confirm what has already
-                             been covered and avoid repeated requests.
+            keyframes:      list of {camera, frame_id, image_path}
+            budget_summary: current budget state
+            visit_history:  executed visits [{round, camera, approach,
+                            reference_frame, problem}, ...]
+            blocked_frames: [FIX-2] reference_frame IDs rejected by spatial
+                            dedup — VLM must not re-propose these.
         """
-        observation_images = self._load_images(keyframes)
-        recent_images = self._load_images(recent_evidence or [])
-        images = observation_images + recent_images
+        images  = self._load_images(keyframes)
         history = visit_history  or []
         blocked = blocked_frames or []
 
         # Save readable input log (no image data)
         with open(self.analysis_dir / "vlm_input.json", "w") as f:
             json.dump({
-                "observation_frame_count": len(keyframes),
-                "recent_evidence_count":   len(recent_evidence or []),
-                "frames_sent":  [
+                "keyframe_count":  len(keyframes),
+                "keyframes_sent":  [
                     {k: v for k, v in kf.items() if k != "b64_jpeg"}
                     for kf in images
                 ],
@@ -84,10 +73,9 @@ class VLMController:
                 "blocked_frames":  blocked,          # [FIX-2] logged for debugging
             }, f, indent=2)
 
-        print(f"[VLMController] Sending {len(images)} frames to "
+        print(f"[VLMController] Sending {len(images)} keyframes to "
               f"{self.cfg.get('model', 'unknown')} "
               f"({self.cfg.get('provider', 'anthropic')})  "
-              f"recent_evidence={len(recent_images)}  "
               f"blocked_frames={len(blocked)} ...")
         decision = self._call_vlm(images, budget_summary, history, blocked)
 
@@ -108,12 +96,9 @@ class VLMController:
             img_path = Path(kf.get("image_path", ""))
             if not img_path.exists():
                 continue
-            encoded = self._encode_image(img_path)
-            if not encoded:
-                continue
-            b64, media_type = encoded
+            b64 = self._encode_image(img_path)
             if b64:
-                images.append({**kf, "b64_jpeg": b64, "media_type": media_type})
+                images.append({**kf, "b64_jpeg": b64})
         return images
 
     # ------------------------------------------------------------------ #
@@ -156,13 +141,13 @@ class VLMController:
                 "type": "image",
                 "source": {
                     "type":       "base64",
-                    "media_type": img.get("media_type", "image/jpeg"),
+                    "media_type": "image/jpeg",
                     "data":       img["b64_jpeg"]
                 }
             })
             content.append({
                 "type": "text",
-                "text": self._frame_label(img)
+                "text": f"[{img['frame_id']} | {img['camera']}]"
             })
 
         content.append({
@@ -214,13 +199,12 @@ class VLMController:
             user_content.append({
                 "type": "image_url",
                 "image_url": {
-                    "url": (f"data:{img.get('media_type', 'image/jpeg')};"
-                            f"base64,{img['b64_jpeg']}")
+                    "url": f"data:image/jpeg;base64,{img['b64_jpeg']}"
                 }
             })
             user_content.append({
                 "type": "text",
-                "text": self._frame_label(img)
+                "text": f"[{img['frame_id']} | {img['camera']}]"
             })
 
         user_content.append({
@@ -245,16 +229,6 @@ class VLMController:
         return self._parse_response(raw_text)
 
     # ------------------------------------------------------------------ #
-    #  Frame labeling
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _frame_label(img: dict) -> str:
-        """Keep recent evidence visually distinct from targetable frames."""
-        if img.get("_recent_evidence"):
-            return f"[RECENT_EVIDENCE | {img['frame_id']} | {img['camera']}]"
-        return f"[{img['frame_id']} | {img['camera']}]"
-
-    # ------------------------------------------------------------------ #
     #  Prompt builder
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -265,47 +239,11 @@ class VLMController:
         visits_remaining = budget_summary.get("visits_remaining", "?")
         cameras_allowed  = budget_summary.get("cameras_allowed", [])
         frames_per_visit = budget_summary.get("frames_per_visit", 20)
-        round_index = budget_summary.get("round_index", "?")
-        max_rounds = budget_summary.get("max_rounds", "?")
         # Per-round cap: how many visits will actually be executed this round.
         # This is always <= visits_remaining (global leftover).
         visits_this_round = budget_summary.get("visits_per_round", visits_remaining)
         history  = visit_history  or []
         blocked  = blocked_frames or []
-
-        if round_index == 1:
-            round_focus = """
-## Round Focus
-This is Round 1: prioritize broad room coverage and visually complete framing.
-Select large missing room areas, corners, walls, floor bands, and regions absent
-from all keyframes before selecting close object detail. Prefer camera_03
-orbit_high for broad coverage. Pick object close-ups only if an object is barely
-visible or strongly occluded.
-""".strip()
-        elif round_index == 2:
-            round_focus = """
-## Round Focus
-This is Round 2: balance remaining room coverage with important object detail.
-Include at least one broad coverage visit if any corner, wall-side region, or
-large empty-looking area still appears incomplete. Then use close orbits for
-objects that clearly lack side/back views. Do not spend the whole round on the
-same object.
-""".strip()
-        elif round_index == 3:
-            round_focus = """
-## Round Focus
-This is Round 3: improve final visual quality with the few highest-impact gaps.
-Choose visits that make the final scene look more complete: obvious empty
-corners, poorly separated objects, missing side/back views, or strong
-occlusions. Do not repeat close-ups of objects already covered unless no broad
-coverage gaps remain.
-""".strip()
-        else:
-            round_focus = """
-## Round Focus
-Prioritize broad coverage first, then object detail, and avoid repeating the
-same object or location when other meaningful gaps are visible.
-""".strip()
 
         # camera_03 description emphasises area-coverage efficiency
         cam_lines = []
@@ -332,13 +270,7 @@ same object or location when other meaningful gaps are visible.
         frame_refs = "\n".join(
             f"  {img['frame_id']} ({img['camera']})"
             for img in images
-            if not img.get("_recent_evidence")
         )
-        recent_refs = "\n".join(
-            f"  {img['frame_id']} ({img['camera']})"
-            for img in images
-            if img.get("_recent_evidence")
-        ) or "  (none yet — this is the first round or no recent evidence was available)"
 
         # Executed visit history
         if history:
@@ -357,9 +289,6 @@ same object or location when other meaningful gaps are visible.
         else:
             blocked_section = "  (none)"
 
-        # Keep the model's written reasoning short. Earlier prompts asked for
-        # frame-by-frame analysis, which helped debugging but made Claude spend
-        # many output tokens and occasionally truncate the required JSON.
         return f"""
 ## Already Captured (Previous Visits)
 The following locations have already been visited. Do NOT select the same
@@ -375,37 +304,20 @@ no effect. Choose a completely different frame showing a different area.
 {blocked_section}
 
 ## Your Budget This Round
-You are in round {round_index} of {max_rounds}.
 You may submit AT MOST {visits_this_round} visit(s) this round.
 Each visit captures {frames_per_visit} frames. Total frames remaining: {frames_remaining}.
 
 Cameras available:
 {cam_desc}
 
-{round_focus}
-
-## Observation Frames
-These are the current visual context frames. Use ONLY these frame IDs as
-reference_frame values in your output.
-
+## Keyframe Reference List
 {frame_refs}
-
-## Recent Evidence Frames
-These frames show areas already captured by recent supplementary visits.
-Use them as visual memory to avoid requesting the same area again. They are
-NOT normal target candidates: do not use RECENT_EVIDENCE frame IDs as
-reference_frame values.
-
-{recent_refs}
 
 ## Your Task
 
-Step 1 — Privately survey the images and identify areas that still look
-visually incomplete (dark, overexposed, washed out, flat, blurry, occluded,
-visible from only one side, or simply absent from all keyframes).
+Step 1 — Survey the images and list every area that still looks visually
+incomplete (dark, flat, blurry, or simply absent from all keyframes).
 Exclude anything already addressed by previous visits or blocked frames.
-First check broad room/corner/edge coverage, then check object details.
-Do not write frame-by-frame notes in the JSON output.
 
 Step 2 — From that list, select the {visits_this_round} MOST IMPORTANT
 gaps only. Quality over quantity: a small focused list is better than a
@@ -421,18 +333,6 @@ Rules:
   show the same scene content, pick only one — do not propose visits
   for both.
 - Do NOT re-use any frame_id from the blocked list.
-- The reference_frame in every visit must come from Observation Frames, not
-  Recent Evidence Frames.
-- Broad room/corner/edge coverage outranks repeated close-ups of the same
-  object. After an object has already been visited, prefer a different object
-  or a broad room gap unless that object is still the only serious issue.
-- Good lighting alone is NOT evidence that coverage is complete. If a region
-  is bright but lacks shadows, depth cues, side/back views, or object
-  separation, treat it as visually uncertain and consider a supplementary
-  capture.
-- Do not stop just because images look evenly lit. Stop only when the room
-  areas and object surfaces appear geometrically complete from the visible
-  viewpoints.
 - For large uncovered regions: use camera_03 orbit_high.
 - For specific objects seen from only one side: use camera_01 or
   camera_02 orbit_close.
@@ -440,13 +340,12 @@ Rules:
 If no meaningful gaps remain, set should_capture to false.
 
 Output ONLY this JSON (no markdown, no explanation).
-The "reasoning" field must be a concise visual summary, not a full
-chain-of-thought. Limit it to 80 words or fewer. Mention only the top
-2-3 remaining gaps and whether recent evidence or blocked frames changed
-the decision.
+The "reasoning" field must be filled first — write your visual analysis
+there before deciding on visits. This ensures your visit choices follow
+from what you actually observed in the images.
 
 {{
-  "reasoning": "Concise summary under 80 words: top remaining broad coverage gaps first, then object detail gaps; mention any repeated/blocked areas avoided.",
+  "reasoning": "Go through each keyframe one by one. Note what looks dark, flat, or absent. Then identify which gaps are NOT already covered by previous visits or blocked frames. Finally, rank the remaining gaps by importance and explain why.",
   "should_capture": true or false,
   "overall_assessment": "one sentence describing the most critical remaining gap",
   "visits": [
@@ -508,8 +407,8 @@ the decision.
 
     # ------------------------------------------------------------------ #
     @staticmethod
-    def _encode_image(path: Path, max_dim: int = 512) -> Optional[tuple]:
-        """Return (base64, media_type), preserving correct MIME metadata."""
+    def _encode_image(path: Path, max_dim: int = 512) -> Optional[str]:
+        """Load image and return base64 JPEG. Uses PIL if available."""
         try:
             from PIL import Image
             import io
@@ -517,7 +416,7 @@ the decision.
             img.thumbnail((max_dim, max_dim), Image.LANCZOS)
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=80)
-            return base64.b64encode(buf.getvalue()).decode("utf-8"), "image/jpeg"
+            return base64.b64encode(buf.getvalue()).decode("utf-8")
         except ImportError:
             pass
         except Exception as e:
@@ -526,14 +425,7 @@ the decision.
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-            media_type = {
-                ".png":  "image/png",
-                ".jpg":  "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".webp": "image/webp",
-                ".gif":  "image/gif",
-            }.get(path.suffix.lower(), "application/octet-stream")
-            return base64.b64encode(raw).decode("utf-8"), media_type
+            return base64.b64encode(raw).decode("utf-8")
         except Exception as e:
             print(f"[VLMController] Could not encode {path}: {e}")
             return None
@@ -556,8 +448,8 @@ if something looks incomplete, flag it. If everything looks well-captured,
 say so even if you have budget remaining.
 
 Important rules:
-- Before deciding, inspect the images carefully, but keep the written
-  "reasoning" field concise. Do not output frame-by-frame analysis.
+- Always fill the "reasoning" field first. Analyze each keyframe before
+  deciding on visits — do not skip straight to the visit list.
 - If a reference_frame appears in the "Blocked Frames" list in the user
   prompt, do NOT select it. It will be rejected regardless.
 - Always pick a frame showing a genuinely different part of the scene.

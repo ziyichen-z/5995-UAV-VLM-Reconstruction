@@ -38,9 +38,12 @@ except ImportError:
 
 class ExplorationManager:
     def __init__(self, config: dict, output_dir: Path,
-                 camera_objects: dict, room_manifest: dict):
+                 camera_objects: dict, room_manifest: dict,
+                 base_run_dir: Path = None):
         self.config        = config
         self.output_dir    = output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.base_run_dir  = base_run_dir or output_dir
         self.cameras       = camera_objects
         self.room_manifest = room_manifest
         self.supp_dir      = output_dir / "supplementary"
@@ -57,7 +60,6 @@ class ExplorationManager:
         self.sparsity_threshold    = exp_cfg.get("sparsity_threshold", 0.15)
         self.min_dist_sparse       = exp_cfg.get("min_dist_sparse", 2.5)
         self.min_dist_dense        = exp_cfg.get("min_dist_dense", 1.5)
-        self.min_dist_schedule     = exp_cfg.get("min_dist_schedule", [])
         self.max_orbits_per_object = exp_cfg.get("max_orbits_per_object", 2)
 
         # Per-round visit cap schedule.
@@ -75,9 +77,6 @@ class ExplorationManager:
             self.visits_schedule = [base] * self.max_rounds
         print(f"[ExplorationManager] Per-round visit schedule: {self.visits_schedule} "
               f"(max_visits={self.budget.max_visits} / max_rounds={self.max_rounds})")
-        if self.min_dist_schedule:
-            print(f"[ExplorationManager] Per-round block distance schedule: "
-                  f"{self.min_dist_schedule}")
 
     # ------------------------------------------------------------------ #
     def explore(self, initial_coverage: dict, pose_logs: dict) -> dict:
@@ -89,10 +88,10 @@ class ExplorationManager:
             pose_logs:        {cam_id: [pose_entries]} for keyframe selection
         """
         round_logs       = []
+        step_logs        = []
         current_coverage = initial_coverage
         visit_history    = []   # executed visits, accumulates across all rounds
         orbit_counts     = {}   # object_id -> times orbited
-        recent_evidence  = []   # representative frames from successful supplementary visits
 
         # [FIX-2] blocked_frames: reference_frame IDs that were proposed by VLM
         # but rejected by spatial dedup. Forwarded to VLM each round so it
@@ -123,12 +122,8 @@ class ExplorationManager:
             # Per-round visit cap from increasing schedule [3, 4, 5, ...]
             self.visits_per_round = self.visits_schedule[rnd - 1]
 
-            # Prefer an explicit block distance schedule when configured.
-            # Otherwise keep the legacy 15% per-round decay.
-            if len(self.min_dist_schedule) == self.max_rounds:
-                round_min_dist = float(self.min_dist_schedule[rnd - 1])
-            else:
-                round_min_dist = round(min_dist * (1.0 - 0.15 * (rnd - 1)), 3)
+            # Decay min_dist 15% per round: Round1=1.5m, Round2=1.275m, Round3=1.05m
+            round_min_dist = round(min_dist * (1.0 - 0.15 * (rnd - 1)), 3)
 
             print(f"\n[ExplorationManager] Round {rnd}/{self.max_rounds}  "
                   f"Coverage: {ratio:.1%}  "
@@ -152,7 +147,6 @@ class ExplorationManager:
             uncovered = current_coverage.get("uncovered_regions", [])
             keyframes = self._select_keyframes(pose_logs, uncovered,
                                                base_pose_logs=base_pose_logs)
-            recent_keyframes = self._select_recent_evidence(recent_evidence)
             if not keyframes:
                 print("[ExplorationManager] No keyframes available for VLM.")
                 break
@@ -164,15 +158,12 @@ class ExplorationManager:
             budget_for_vlm = {
                 **self.budget.summary(),
                 "visits_per_round": self.visits_per_round,
-                "round_index": rnd,
-                "max_rounds": self.max_rounds,
             }
             decision = self.vlm.decide(
                 keyframes,
                 budget_for_vlm,
                 visit_history=visit_history,
                 blocked_frames=blocked_frames,
-                recent_evidence=recent_keyframes,
             )
 
             if not decision.get("should_capture", False):
@@ -239,6 +230,7 @@ class ExplorationManager:
                 waypoints = waypoints[:n_frames]
 
                 # Consume budget
+                visit_round_id = f"round_{rnd:02d}_visit_{self.budget.visits_used + 1:02d}"
                 ok = self.budget.consume(cam_id, len(waypoints), problem)
                 if not ok:
                     continue
@@ -255,6 +247,8 @@ class ExplorationManager:
                 if obj_id:
                     orbit_counts[obj_id] = orbit_counts.get(obj_id, 0) + 1
 
+                coverage_before_visit = current_coverage["coverage_ratio"]
+
                 # Proactively block base frames that would land on the same orbit
                 # center next round, so VLM stops wasting proposals on locations
                 # that spatial dedup would reject anyway.
@@ -262,35 +256,59 @@ class ExplorationManager:
                     cx, cy, round_min_dist, base_pose_logs, blocked_frames
                 )
 
-                # [FIX-1] Increment per-round visit counter after successful consume.
-                # Use the visit index in the capture directory so multiple
-                # visits by the same camera in one round do not overwrite each
-                # other's frames or pose logs.
-                visit_seq = visits_this_round + 1
+                # [FIX-1] Increment per-round visit counter after successful consume
                 visits_this_round += 1
 
                 # Execute capture
-                supp_round_id = f"round_{rnd:02d}_visit_{visit_seq:02d}"
                 cap_mgr = CaptureManager(self.config, self.output_dir, self.cameras)
                 cap_mgr.captures_dir = self.supp_dir
-                cap_mgr.capture_all({cam_id: waypoints}, round_id=supp_round_id)
+                cap_mgr.capture_all({cam_id: waypoints}, round_id=visit_round_id)
                 frames_this_round += len(waypoints)
 
                 # Update pose_logs for next round's VLM input
-                new_pose_log_path = (self.supp_dir / supp_round_id / cam_id /
-                                     "pose_log.json")
+                new_pose_log_path = (self.supp_dir / visit_round_id /
+                                     cam_id / "pose_log.json")
                 if new_pose_log_path.exists():
                     with open(new_pose_log_path) as f:
                         new_poses = json.load(f)
                     pose_logs.setdefault(cam_id, []).extend(new_poses)
-                    evidence = self._make_recent_evidence_frame(
-                        new_poses, cam_id, rnd, visit_seq, cx, cy,
-                        approach, problem
-                    )
-                    if evidence:
-                        recent_evidence.append(evidence)
                     print(f"[ExplorationManager] Added {len(new_poses)} new poses "
                           f"for {cam_id} to pose_logs.")
+
+                    current_coverage = self.coverage_mgr.analyze_from_poses(pose_logs)
+                    coverage_after_visit = current_coverage["coverage_ratio"]
+                    step_log = {
+                        "policy":          "vlm",
+                        "step":            len(step_logs) + 1,
+                        "round":           rnd,
+                        "visit_id":        visit_round_id,
+                        "camera":          cam_id,
+                        "approach":        approach,
+                        "reference_frame": ref_frame,
+                        "frames_captured": len(waypoints),
+                        "coverage_before": coverage_before_visit,
+                        "coverage_after":  coverage_after_visit,
+                        "coverage_gain":   round(
+                            coverage_after_visit - coverage_before_visit, 4
+                        ),
+                        "cumulative_gain": round(
+                            coverage_after_visit -
+                            initial_coverage["coverage_ratio"], 4
+                        ),
+                        "budget_remaining": self.budget.frames_remaining(),
+                        "problem":          problem,
+                    }
+                    step_logs.append(step_log)
+
+                    step_path = self.supp_dir / "step_coverage_log.json"
+                    step_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(step_path, "w") as f:
+                        json.dump(step_logs, f, indent=2)
+
+                    print(f"[ExplorationManager] Step {step_log['step']}: "
+                          f"{coverage_before_visit:.1%} -> "
+                          f"{coverage_after_visit:.1%} "
+                          f"(gain {step_log['coverage_gain']:.1%})")
 
             if round_blocked_frames:
                 print(f"[ExplorationManager] Round {rnd} newly blocked frames "
@@ -299,7 +317,7 @@ class ExplorationManager:
             # ── Re-run coverage check including supplementary frames ───────
             all_poses_for_coverage = {}
 
-            base_dir = self.output_dir / "captures" / "base"
+            base_dir = self.base_run_dir / "captures" / "base"
             if base_dir.exists():
                 for cam_dir in base_dir.iterdir():
                     if cam_dir.is_dir():
@@ -326,8 +344,7 @@ class ExplorationManager:
                 all_poses_for_coverage
             )
 
-            # If this round did not capture any frames, continue only when a
-            # later round may loosen blocking or change the VLM context.
+            # ── 如果这一轮实际拍摄帧数为 0 ──────────────────────────────────
             # [FIX-3] Don't stop immediately — just log and continue to next
             # round. The visit cap may have deferred all VLM picks, and Round
             # N+1 will have a fresh VLM call with updated coverage info.
@@ -363,6 +380,7 @@ class ExplorationManager:
             "final_coverage":   current_coverage,
             "rounds_completed": len(round_logs),
             "round_logs":       round_logs,
+            "step_logs":        step_logs,
             "budget":           self.budget.summary()
         }
 
@@ -487,7 +505,7 @@ class ExplorationManager:
         # Re-compute coverage with fallback frames included
         all_poses: dict = {}
 
-        base_dir = self.output_dir / "captures" / "base"
+        base_dir = self.base_run_dir / "captures" / "base"
         if base_dir.exists():
             for cam_dir in base_dir.iterdir():
                 if cam_dir.is_dir():
@@ -633,71 +651,6 @@ class ExplorationManager:
         return keyframes
 
     # ------------------------------------------------------------------ #
-    #  Recent evidence selection for VLM
-    # ------------------------------------------------------------------ #
-    def _make_recent_evidence_frame(self, poses: list, cam_id: str,
-                                    round_id: int, visit_seq: int,
-                                    center_x: float, center_y: float,
-                                    approach: str, problem: str) -> dict:
-        """
-        Pick one representative frame from a completed supplementary visit.
-
-        Design note:
-        These frames are not new target hints. They are visual evidence of
-        places already captured, giving the VLM a lightweight "memory" between
-        stateless API calls. We use the middle frame of the orbit because it is
-        usually more representative than the first or last frame.
-        """
-        if not poses:
-            return {}
-        pose = poses[len(poses) // 2]
-        frame_idx = pose.get("frame_index", len(poses) // 2)
-        return {
-            "frame_id": (f"recent_r{round_id:02d}_v{visit_seq:02d}_"
-                         f"{cam_id}_frame_{frame_idx:04d}"),
-            "camera": cam_id,
-            "image_path": pose["image_path"],
-            "location": pose.get("location", {}),
-            "round": round_id,
-            "visit_seq": visit_seq,
-            "center_x": center_x,
-            "center_y": center_y,
-            "approach": approach,
-            "problem": problem,
-            "_recent_evidence": True,
-        }
-
-    def _select_recent_evidence(self, evidence_pool: list,
-                                max_items: int = 3) -> list:
-        """
-        Select up to three recent evidence frames for the next VLM call.
-
-        We prefer the latest completed round so the model sees what changed
-        most recently. If there are more than three visits in that round, use
-        farthest-point sampling over visit centers to avoid showing redundant
-        orbit evidence from the same local area.
-        """
-        if not evidence_pool:
-            return []
-
-        latest_round = max(e.get("round", 0) for e in evidence_pool)
-        latest = [e for e in evidence_pool if e.get("round") == latest_round]
-        selected = self._farthest_entry_sample(latest, max_items)
-
-        if len(selected) < max_items:
-            selected_ids = {e["frame_id"] for e in selected}
-            older = sorted(
-                [e for e in evidence_pool if e["frame_id"] not in selected_ids],
-                key=lambda e: (e.get("round", 0), e.get("visit_seq", 0)),
-                reverse=True,
-            )
-            selected.extend(older[:max_items - len(selected)])
-
-        print(f"[ExplorationManager] Recent evidence: {len(selected)} frames "
-              f"from {len(evidence_pool)} successful visits")
-        return selected[:max_items]
-
-    # ------------------------------------------------------------------ #
     #  Translate VLM visit to waypoints
     # ------------------------------------------------------------------ #
     def _resolve_visit(self, cam_id: str, approach: str,
@@ -810,34 +763,6 @@ class ExplorationManager:
             selected_idx.append(farthest_idx)
 
         return [poses[i] for i in selected_idx]
-
-    @staticmethod
-    def _farthest_entry_sample(entries: list, n: int) -> list:
-        """Farthest-point sampling for visit-level evidence entries."""
-        if not entries:
-            return []
-        n = min(n, len(entries))
-        selected_idx = [0]
-
-        while len(selected_idx) < n:
-            max_min_dist = -1
-            farthest_idx = None
-            for i, entry in enumerate(entries):
-                if i in selected_idx:
-                    continue
-                min_d = min(
-                    math.hypot(entry["center_x"] - entries[j]["center_x"],
-                               entry["center_y"] - entries[j]["center_y"])
-                    for j in selected_idx
-                )
-                if min_d > max_min_dist:
-                    max_min_dist = min_d
-                    farthest_idx = i
-            if farthest_idx is None:
-                break
-            selected_idx.append(farthest_idx)
-
-        return [entries[i] for i in selected_idx]
 
     def _preblock_visited_frames(self, cx: float, cy: float,
                                    current_min_dist: float,
