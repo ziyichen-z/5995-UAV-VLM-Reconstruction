@@ -21,6 +21,16 @@ Fix log (2026-04):
           frames that will never be executed.
   [FIX-3] camera_03 description updated to convey its area-coverage
           efficiency advantage, steering VLM toward it for large gaps.
+
+Reasoning probe (2026-05):
+  After the VLM returns its JSON decision, a second, separate call asks
+  the same VLM to *describe the algorithm or strategy it just used* to
+  reach that decision. This is a "self-explanation" probe — useful as a
+  starting hypothesis for understanding VLM behaviour, with the caveat
+  that LLM self-explanations are known to be post-hoc rationalisations
+  (Turpin et al. 2023). The answer is logged to vlm_self_reasoning.json
+  for offline analysis and never feeds back into the pipeline.
+  Toggle via cfg["vlm"]["probe_reasoning"] (default: True).
 """
 
 import json
@@ -97,6 +107,18 @@ class VLMController:
         if decision.get("reasoning"):
             print(f"[VLMController] Reasoning: {decision['reasoning'][:200]}...")
         print(f"[VLMController] Decision: {decision.get('overall_assessment', '')}")
+
+        # ---- Reasoning probe ----------------------------------------- #
+        # Ask the SAME VLM to describe the algorithm it just used.
+        # This is logged for offline analysis (revealed-preferences study).
+        # It does NOT feed back into the pipeline.
+        if self.cfg.get("probe_reasoning", True):
+            try:
+                self._probe_reasoning(images, budget_summary, history,
+                                      blocked, decision)
+            except Exception as e:
+                print(f"[VLMController] Reasoning probe failed: {e}")
+
         return decision
 
     # ------------------------------------------------------------------ #
@@ -483,6 +505,203 @@ the decision.
             }
 
     # ------------------------------------------------------------------ #
+    #  Reasoning probe — "how did you decide?"
+    # ------------------------------------------------------------------ #
+    #
+    # Run AFTER the decision call. Feeds the same images + the model's own
+    # JSON decision back to the same VLM, and asks an open-ended question
+    # about the algorithm / strategy it used. The answer is appended to
+    # vlm_self_reasoning.json (one entry per call).
+    #
+    # IMPORTANT CAVEAT: LLM self-explanations are well known to be
+    # post-hoc rationalisations and are sycophantic (Turpin et al. 2023;
+    # Sharma et al. 2023). This probe is therefore a hypothesis generator,
+    # not ground truth. Behavioural validation should be done separately.
+    # ------------------------------------------------------------------ #
+    def _probe_reasoning(self, images: list, budget_summary: dict,
+                         visit_history: list, blocked_frames: list,
+                         decision: dict) -> None:
+        provider = self.cfg.get("provider", "anthropic")
+        probe_question = self._build_probe_prompt(
+            images, budget_summary, visit_history, blocked_frames, decision
+        )
+
+        if provider == "anthropic":
+            answer = self._probe_anthropic(images, probe_question)
+        elif provider == "qwen":
+            answer = self._probe_qwen(images, probe_question)
+        else:
+            answer = f"[unsupported provider: {provider}]"
+
+        # Append (not overwrite) so multi-round runs keep full history
+        log_path = self.analysis_dir / "vlm_self_reasoning.json"
+        entries = []
+        if log_path.exists():
+            try:
+                with open(log_path, "r") as f:
+                    entries = json.load(f)
+                if not isinstance(entries, list):
+                    entries = [entries]
+            except (json.JSONDecodeError, OSError):
+                entries = []
+
+        entries.append({
+            "round_index":     budget_summary.get("round_index"),
+            "frames_sent":     len(images),
+            "decision_summary": decision.get("overall_assessment", ""),
+            "decision_visits": [
+                {
+                    "camera":          v.get("camera"),
+                    "approach":        v.get("approach"),
+                    "reference_frame": v.get("reference_frame"),
+                    "problem":         v.get("problem"),
+                }
+                for v in decision.get("visits", [])
+            ],
+            "self_reasoning":  answer,
+        })
+
+        with open(log_path, "w") as f:
+            json.dump(entries, f, indent=2)
+
+        print(f"[VLMController] Self-reasoning probed ({len(answer)} chars) "
+              f"-> {log_path.name}")
+
+    @staticmethod
+    def _build_probe_prompt(images: list, budget_summary: dict,
+                            visit_history: list, blocked_frames: list,
+                            decision: dict) -> str:
+        """Open-ended question about the algorithm / strategy used."""
+        decision_str = json.dumps(
+            {
+                "should_capture":     decision.get("should_capture"),
+                "overall_assessment": decision.get("overall_assessment"),
+                "visits":             decision.get("visits", []),
+                "stop_reason":        decision.get("stop_reason"),
+            },
+            indent=2,
+        )
+        return f"""
+You just produced the following decision in response to the images and
+context I showed you a moment ago:
+
+{decision_str}
+
+Now, in plain language, please answer ALL of the following questions
+about how you arrived at that decision. Be as concrete and specific as
+you can. Speculation about your own internals is welcome — say "I don't
+know" if you truly don't.
+
+1. What algorithm or decision strategy did you use? If your strategy has
+   a name (e.g. frontier exploration, next-best-view, information-gain
+   maximisation, greedy coverage, heuristic ranking, etc.), name it. If
+   it does not match a known algorithm, describe the procedure step by
+   step in your own words.
+
+2. What objective (utility function / score) were you maximising, if
+   any? Express it as concretely as possible — even a rough formula or
+   ordered list of priorities helps.
+
+3. What constraints did you treat as hard limits? What did you trade off
+   against what?
+
+4. Which specific frames or visual cues drove the decision, and why
+   those rather than the alternatives?
+
+5. If you ran this same decision 10 times, would you give the same
+   answer? If not, what would vary, and what would stay fixed?
+
+6. Honest self-assessment: are you reasonably confident your description
+   above reflects what actually drove your choice, or is it possible
+   you're reconstructing a plausible-sounding story after the fact?
+
+Reply in plain prose. Use numbered sections matching the questions
+above. Do NOT output JSON.
+""".strip()
+
+    def _probe_anthropic(self, images: list, probe_question: str) -> str:
+        try:
+            import anthropic
+        except ImportError:
+            return "[anthropic SDK not installed]"
+
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            return "[ANTHROPIC_API_KEY not set]"
+
+        client = anthropic.Anthropic(api_key=api_key)
+
+        content = []
+        for img in images:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type":       "base64",
+                    "media_type": img.get("media_type", "image/jpeg"),
+                    "data":       img["b64_jpeg"]
+                }
+            })
+            content.append({
+                "type": "text",
+                "text": self._frame_label(img)
+            })
+        content.append({"type": "text", "text": probe_question})
+
+        try:
+            response = client.messages.create(
+                model=self.cfg.get("model", "claude-sonnet-4-6"),
+                max_tokens=self.cfg.get("probe_max_tokens", 2048),
+                system=PROBE_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": content}],
+            )
+            return response.content[0].text.strip()
+        except Exception as e:
+            return f"[anthropic probe error: {e}]"
+
+    def _probe_qwen(self, images: list, probe_question: str) -> str:
+        try:
+            from openai import OpenAI
+        except ImportError:
+            return "[openai SDK not installed]"
+
+        api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+        if not api_key:
+            return "[DASHSCOPE_API_KEY not set]"
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        )
+
+        user_content = []
+        for img in images:
+            user_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": (f"data:{img.get('media_type', 'image/jpeg')};"
+                            f"base64,{img['b64_jpeg']}")
+                }
+            })
+            user_content.append({
+                "type": "text",
+                "text": self._frame_label(img)
+            })
+        user_content.append({"type": "text", "text": probe_question})
+
+        try:
+            response = client.chat.completions.create(
+                model=self.cfg.get("model", "qwen-vl-max"),
+                messages=[
+                    {"role": "system", "content": PROBE_SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_content},
+                ],
+                max_tokens=self.cfg.get("probe_max_tokens", 2048),
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"[qwen probe error: {e}]"
+
+    # ------------------------------------------------------------------ #
     #  Mock fallback
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -563,4 +782,28 @@ Important rules:
 - Always pick a frame showing a genuinely different part of the scene.
 
 Return ONLY valid JSON. No markdown, no prose outside the JSON.
+""".strip()
+
+
+# ------------------------------------------------------------------ #
+#  System prompt for the reasoning probe (self-explanation pass)
+# ------------------------------------------------------------------ #
+PROBE_SYSTEM_PROMPT = """
+You are a vision-language model whose decision-making behaviour is being
+studied. You have just produced a JSON decision for an indoor 3D
+reconstruction next-best-view task. The researcher is now asking you to
+explain — in plain language — what algorithm, objective, and constraints
+you used to arrive at that decision.
+
+Guidelines for your reply:
+- Be specific and concrete. Name algorithms or strategies when you can.
+- Distinguish between (a) what you actually used and (b) what you might
+  expect a competent agent to use. If they differ, say so.
+- If you are confabulating a plausible-sounding story rather than
+  reporting an actual procedure, please say "I am not sure this reflects
+  my real process" and explain what you do know.
+- It is acceptable — even useful — to say "I don't know" for parts you
+  cannot introspect.
+- Reply in plain prose with numbered sections matching the questions.
+  Do NOT output JSON. Do NOT change or restate the original decision.
 """.strip()
